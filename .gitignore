@@ -1,3 +1,4 @@
 .env
 *.log
 bot_trading
+bot
