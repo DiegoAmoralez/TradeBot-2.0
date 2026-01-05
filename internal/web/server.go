@@ -25,7 +25,8 @@ func NewServer(engine *engine.TradingEngine, port string) *Server {
 func (s *Server) Start() {
 	http.HandleFunc("/", s.handleIndex)
 	http.HandleFunc("/api/stats", s.handleStats)
-	http.HandleFunc("/api/positions", s.handlePositions)
+	http.HandleFunc("/api/positions/", s.handlePositions) // Trailing slash to match /api/positions/{id}
+	http.HandleFunc("/api/signals", s.handleSignals)
 	http.HandleFunc("/api/health", s.handleHealth)
 	http.HandleFunc("/api/type", s.handleType)
 	http.HandleFunc("/api/history", s.handleHistory)
@@ -67,7 +68,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"free_slots":     s.engine.GetFreeSlots(),
 		"today_profit":   stats.RealizedPL, // Proxy for today
 		"total_profit":   stats.TotalPL,
-		"active_signals": 0, // Not tracking candidates in stats yet
+		"active_signals": len(s.engine.GetActiveSignals()),
 		"running":        s.engine.IsRunning(),
 		"strictness":     s.engine.GetStrictness(),
 		"trading_mode":   s.engine.GetTradingMode(),
@@ -89,24 +90,74 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
+	// Extract ID from path if present
+	path := r.URL.Path
+	id := ""
+	if len(path) > len("/api/positions/") {
+		id = path[len("/api/positions/"):]
+	}
+
+	// Handle DELETE /api/positions/{id}
+	if r.Method == http.MethodDelete {
+		if id == "" {
+			http.Error(w, "Position ID required", http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("🔄 Closing position via API: %s", id)
+		ctx := context.Background()
+		err := s.engine.ClosePositionByID(ctx, id)
+		if err != nil {
+			log.Printf("❌ Failed to close position %s: %v", id, err)
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		log.Printf("✅ Position %s closed successfully", id)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Handle GET /api/positions or /api/positions/
 	positions := s.engine.GetPositions()
 
+	type logEntry struct {
+		Time   int64   `json:"time"`
+		Type   string  `json:"type"`
+		Price  float64 `json:"price"`
+		Size   float64 `json:"size"`
+		Reason string  `json:"reason"`
+	}
+
 	type positionResponse struct {
-		ID           string  `json:"id"`
-		Symbol       string  `json:"symbol"`
-		Side         string  `json:"side"`
-		EntryPrice   float64 `json:"entry_price"`
-		CurrentPrice float64 `json:"current_price"`
-		PositionSize float64 `json:"position_size"`
-		UnrealizedPL float64 `json:"unrealized_pl"`
-		PLPercent    float64 `json:"pl_percent"`
-		TakeProfit   float64 `json:"take_profit"`
-		StopLoss     float64 `json:"stop_loss"`
-		OpenTime     int64   `json:"open_time"`
+		ID           string     `json:"id"`
+		Symbol       string     `json:"symbol"`
+		Side         string     `json:"side"`
+		EntryPrice   float64    `json:"entry_price"`
+		CurrentPrice float64    `json:"current_price"`
+		PositionSize float64    `json:"position_size"`
+		UnrealizedPL float64    `json:"unrealized_pl"`
+		PLPercent    float64    `json:"pl_percent"`
+		TakeProfit   float64    `json:"take_profit"`
+		StopLoss     float64    `json:"stop_loss"`
+		OpenTime     int64      `json:"open_time"`
+		CreatedAt    int64      `json:"created_at"`
+		Reasoning    string     `json:"reasoning"`
+		Log          []logEntry `json:"log"`
 	}
 
 	response := make([]positionResponse, len(positions))
 	for i, p := range positions {
+		var logs []logEntry
+		for _, l := range p.Log {
+			logs = append(logs, logEntry{
+				Time:   l.Time.Unix(),
+				Type:   l.Type,
+				Price:  l.Price,
+				Size:   l.Size,
+				Reason: l.Reason,
+			})
+		}
+
 		response[i] = positionResponse{
 			ID:           p.ID,
 			Symbol:       p.Symbol,
@@ -119,6 +170,37 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 			TakeProfit:   p.TakeProfit,
 			StopLoss:     p.StopLoss,
 			OpenTime:     p.OpenTime.Unix(),
+			CreatedAt:    p.CreatedAt.Unix(),
+			Reasoning:    p.Reasoning,
+			Log:          logs,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
+	signals := s.engine.GetActiveSignals()
+
+	type signalResponse struct {
+		Symbol     string  `json:"symbol"`
+		Side       string  `json:"side"`
+		Confidence float64 `json:"confidence"`
+		Reasoning  string  `json:"reasoning"`
+		FirstSeen  int64   `json:"first_seen"`
+		Duration   int64   `json:"duration"`
+	}
+
+	response := make([]signalResponse, len(signals))
+	for i, sig := range signals {
+		response[i] = signalResponse{
+			Symbol:     sig.Symbol,
+			Side:       sig.Side,
+			Confidence: sig.Confidence,
+			Reasoning:  sig.Reasoning,
+			FirstSeen:  sig.FirstSeen.Unix(),
+			Duration:   int64(time.Since(sig.FirstSeen).Seconds()),
 		}
 	}
 
@@ -578,7 +660,7 @@ const indexHTML = `<!DOCTYPE html>
                     <span class="stat-value" id="unrealized_pl">-</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">💰 Total P&L</span>
+                    <span class="stat-label">💰 Revenue P&L</span>
                     <span class="stat-value" id="total_pl">-</span>
                 </div>
                 <div class="stat-row">
@@ -716,6 +798,14 @@ const indexHTML = `<!DOCTYPE html>
             return date.toLocaleString();
         }
 
+        function formatDuration(seconds) {
+            if (seconds < 60) return seconds + 's';
+            const mins = Math.floor(seconds / 60);
+            if (mins < 60) return mins + 'm ' + (seconds % 60) + 's';
+            const hours = Math.floor(mins / 60);
+            return hours + 'h ' + (mins % 60) + 'm';
+        }
+
         let currentFilter = '';
         let currentSort = 'symbol';
 
@@ -731,14 +821,16 @@ const indexHTML = `<!DOCTYPE html>
 
         async function updateData() {
             try {
-                const [statsRes, positionsRes, historyRes] = await Promise.all([
+                const [statsRes, positionsRes, signalsRes, historyRes] = await Promise.all([
                     fetch('/api/stats'),
                     fetch('/api/positions'),
+                    fetch('/api/signals'),
                     fetch('/api/history')
                 ]);
 
                 const stats = await statsRes.json();
                 let positions = await positionsRes.json();
+                const signals = await signalsRes.json();
                 const history = await historyRes.json();
 
                 // Update stats
@@ -800,13 +892,30 @@ const indexHTML = `<!DOCTYPE html>
                         const plClass = p.pl_percent >= 0 ? 'positive' : 'negative';
                         const showSide = stats.trading_mode !== 'SPOT';
                         
+                        const now = Math.floor(Date.now() / 1000);
+                        const boughtAt = new Date(p.open_time * 1000).toLocaleTimeString();
+                        const cartTime = Math.max(0, p.open_time - p.created_at);
+
+                        // Format log history
+                        const historyRows = (p.log || []).map(l => {
+                             const typeClass = l.type === 'OPEN' ? 'positive' : 'warning'; // OPEN green, DCA yellow
+                             return ` + "`" + `
+                                <div style="display: flex; justify-content: space-between; font-size: 11px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+                                    <span>${new Date(l.time * 1000).toLocaleTimeString()}</span>
+                                    <span class="${typeClass}">${l.type}</span>
+                                    <span>${formatNumber(l.price, 4)}</span>
+                                    <span>${formatNumber(l.size)}</span>
+                                </div>
+                             ` + "`" + `;
+                        }).join('');
+
                         return ` + "`" + `
                             <div class="position-card position-` + "${sideClass}" + `">
                                 <div class="position-header">
                                     <span class="position-symbol">` + "${p.symbol}" + `</span>
                                     <div style="display: flex; align-items: center; gap: 8px;">
                                         ` + "${showSide ? `<span class=\"position-side side-${sideClass}\">${p.side}</span>` : ''}" + `
-                                        <button onclick="closePosition('` + "${p.id}" + `')" style="padding: 4px 8px; font-size: 11px; background: rgba(245, 101, 101, 0.2); border: 1px solid #f56565; color: #f56565; border-radius: 4px; cursor: pointer;">Close</button>
+                                        <button onclick="closePosition('` + "${p.id}" + `', ${p.unrealized_pl}, ${p.position_size})" style="padding: 4px 8px; font-size: 11px; background: rgba(245, 101, 101, 0.2); border: 1px solid #f56565; color: #f56565; border-radius: 4px; cursor: pointer;">Close</button>
                                     </div>
                                 </div>
                                 <div class="position-details">
@@ -817,6 +926,14 @@ const indexHTML = `<!DOCTYPE html>
                                     <div class="detail-item">
                                         <span>Текущая:</span>
                                         <span>` + "${formatNumber(p.current_price, 4)}" + `</span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span>Куплен:</span>
+                                        <span>` + "${boughtAt}" + `</span>
+                                    </div>
+                                    <div class="detail-item">
+                                        <span>В корзине:</span>
+                                        <span>` + "${formatDuration(cartTime)}" + `</span>
                                     </div>
                                     <div class="detail-item">
                                         <span>Размер:</span>
@@ -835,10 +952,23 @@ const indexHTML = `<!DOCTYPE html>
                                         <span>` + "${formatNumber(p.stop_loss, 4)}" + `</span>
                                     </div>
                                 </div>
+                                <details style="margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 8px;">
+                                    <summary style="font-size: 12px; color: #a0aec0; cursor: pointer; outline: none;">Детали и история</summary>
+                                    <div style="margin-top: 8px;">
+                                        <div style="font-size: 11px; color: #cbd5e0; margin-bottom: 8px;">
+                                            <strong>Причина входа:</strong><br>
+                                            ${p.reasoning || 'N/A'}
+                                        </div>
+                                        <div style="font-size: 10px; color: #a0aec0; margin-bottom: 4px;">История сделок (Time | Type | Price | Size)</div>
+                                        ${historyRows}
+                                    </div>
+                                </details>
                             </div>
                         ` + "`" + `;
                     }).join('');
                 }
+
+                // Update Signals (Removed as per user request)
 
                 // Update History
                 const historyTable = document.getElementById('history-table');
@@ -980,20 +1110,30 @@ const indexHTML = `<!DOCTYPE html>
         }
         syncSliders();
 
-        async function closePosition(id) {
-            if (!confirm('Вы уверены, что хотите закрыть эту позицию вручную?')) return;
+        async function closePosition(id, unrealizedPL, size) {
+            const payout = size + unrealizedPL;
+            let message = '';
             
+            if (unrealizedPL < 0) {
+                 message = ` + "`" + `⚠️ ЗАКРЫТИЕ В МИНУС!\n\nВы теряете: ${unrealizedPL.toFixed(2)} USDT\nВы получите на баланс: ${payout.toFixed(2)} USDT\n\nВы уверены?` + "`" + `;
+            } else {
+                 message = ` + "`" + `Закрыть позицию?\n\nПрибыль: +${unrealizedPL.toFixed(2)} USDT\nВы получите на баланс: ${payout.toFixed(2)} USDT` + "`" + `;
+            }
+
+            if (!confirm(message)) {
+                return;
+            }
+
             try {
-                const res = await fetch('/api/close-position', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: id })
+                const res = await fetch('/api/positions/' + id, {
+                     method: 'DELETE' 
                 });
+                
                 if (res.ok) {
                     updateData();
                 } else {
-                    const error = await res.text();
-                    alert('Ошибка при закрытии: ' + error);
+                    const err = await res.text();
+                    alert('Ошибка: ' + err);
                 }
             } catch (error) {
                 console.error('Error closing position:', error);

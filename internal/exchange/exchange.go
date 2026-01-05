@@ -402,11 +402,19 @@ func (e *EmulatorClient) UpdatePosition(ctx context.Context, position *models.Po
 	}
 
 	position.CurrentPrice = price
+
+	// Calculate Gross P&L
+	var grossPL float64
 	if position.Side == "LONG" {
-		position.UnrealizedPL = (price - position.EntryPrice) / position.EntryPrice * position.PositionSize
+		grossPL = (price - position.EntryPrice) / position.EntryPrice * position.PositionSize
 	} else {
-		position.UnrealizedPL = (position.EntryPrice - price) / position.EntryPrice * position.PositionSize
+		grossPL = (position.EntryPrice - price) / position.EntryPrice * position.PositionSize
 	}
+
+	// Apply estimated close fee (0.1%) to match ClosePosition logic and show NET P&L
+	fee := position.PositionSize * 0.001
+	position.UnrealizedPL = grossPL - fee
+
 	position.PLPercent = position.UnrealizedPL / position.PositionSize * 100
 
 	return nil

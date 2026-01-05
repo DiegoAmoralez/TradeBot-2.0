@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +39,9 @@ type TradingEngine struct {
 	onTradeClose func(*models.Trade)
 	onAnalysis   func(string)
 
-	cfg          *config.Config
-	spotStrategy *analysis.SpotStrategy
+	cfg           *config.Config
+	spotStrategy  *analysis.SpotStrategy
+	activeSignals map[string]*models.AISignal
 }
 
 func NewTradingEngine(
@@ -51,19 +53,23 @@ func NewTradingEngine(
 	maxPositions := 5
 	positionSize := 100.0 // USDT
 
+	// Seed RNG
+	rand.Seed(time.Now().UnixNano())
+
 	return &TradingEngine{
-		exchange:     exchange,
-		aiClient:     aiClient,
-		positions:    make(map[string]*models.Position),
-		trades:       make([]*models.Trade, 0),
-		maxPositions: maxPositions,
-		positionSize: positionSize,
-		useAI:        true,
-		isSimulated:  true,
-		strictness:   100, // Default strictness
-		stopChan:     make(chan struct{}),
-		cfg:          cfg,
-		spotStrategy: analysis.NewSpotStrategy(cfg),
+		exchange:      exchange,
+		aiClient:      aiClient,
+		positions:     make(map[string]*models.Position),
+		trades:        make([]*models.Trade, 0),
+		maxPositions:  maxPositions,
+		positionSize:  positionSize,
+		useAI:         true,
+		isSimulated:   true,
+		strictness:    100, // Default strictness
+		stopChan:      make(chan struct{}),
+		cfg:           cfg,
+		spotStrategy:  analysis.NewSpotStrategy(cfg),
+		activeSignals: make(map[string]*models.AISignal),
 	}
 }
 
@@ -246,6 +252,9 @@ func (e *TradingEngine) runFullAnalysis() {
 		return
 	}
 
+	// Update active signals (cart)
+	e.updateActiveSignals(signals)
+
 	// Execute trades
 	log.Println("\n💰 EXECUTING TRADES")
 	log.Println("-----------------------------------------------------------")
@@ -301,6 +310,11 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 	l1Chan := make(chan l1Result, len(l0Candidates))
 	sem := make(chan struct{}, 10) // 10 workers
 
+	// Shuffle and limit L1 candidates
+	rand.Shuffle(len(l0Candidates), func(i, j int) {
+		l0Candidates[i], l0Candidates[j] = l0Candidates[j], l0Candidates[i]
+	})
+
 	for _, cand := range l0Candidates {
 		sem <- struct{}{}
 		go func(c exchange.TickerStats) {
@@ -311,7 +325,7 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 				l1Chan <- l1Result{c.Symbol, false, "Fetch error", nil}
 				return
 			}
-			passed, reason, ind := e.spotStrategy.AnalyzeTrendD1(klines)
+			passed, reason, ind := e.spotStrategy.AnalyzeTrendD1(klines, e.GetStrictness())
 			l1Chan <- l1Result{c.Symbol, passed, reason, ind}
 		}(cand)
 	}
@@ -336,6 +350,12 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 
 	// Reuse phase2 logic pattern or call L2Filter
 	// We need 5m klines for immediate setup
+
+	// Shuffle L1 passed candidates to rotate what gets analyzed in detail
+	rand.Shuffle(len(l1Passed), func(i, j int) {
+		l1Passed[i], l1Passed[j] = l1Passed[j], l1Passed[i]
+	})
+
 	for _, cand := range l1Passed {
 		// Limit processing if too many?
 		if len(l2Passed) >= 10 {
@@ -359,7 +379,6 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 				log.Printf("   ✗ %s: Risk check failed: %s", cand.symbol, riskReason)
 				continue
 			}
-
 			// Prepare signal for AI
 			l2Passed = append(l2Passed, &models.AISignal{
 				Symbol:     cand.symbol,
@@ -369,6 +388,8 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 				Reasoning:  reason,
 				// Store context for AI?
 			})
+		} else {
+			log.Printf("   ✗ %s: L2 Setup failed: %s", cand.symbol, reason)
 		}
 	}
 
@@ -429,6 +450,9 @@ func (e *TradingEngine) runSpotAnalysis(ctx context.Context) {
 			log.Printf("   ⚠️ Signal skipped: AI suggested %s", aiSig.Action)
 		}
 	}
+
+	// Update active signals (cart)
+	e.updateActiveSignals(final)
 
 	// Execution
 	if len(final) > 0 {
@@ -684,6 +708,10 @@ func (e *TradingEngine) executeSignals(ctx context.Context, signals []*models.AI
 			}
 
 			// Add to position
+			// IMPORTANT: Save old values BEFORE calling AddToPosition (emulator modifies the pointer)
+			oldEntryPrice := existingPos.EntryPrice
+			oldPositionSize := existingPos.PositionSize
+
 			chunk, err := e.exchange.AddToPosition(ctx, signal.Symbol, signal.Side, e.positionSize)
 			if err != nil {
 				log.Printf("❌ Failed to add to position %s: %v", signal.Symbol, err)
@@ -692,14 +720,16 @@ func (e *TradingEngine) executeSignals(ctx context.Context, signals []*models.AI
 
 			e.mu.Lock()
 			// Update Engine State (Weighted Average)
-			// NewAvg = (OldSize + NewSize) / (OldQty + NewQty)
-			// oldQty = Size/Entry
-			oldQty := existingPos.PositionSize / existingPos.EntryPrice
+			// For Emulator: it already updated existingPos, but we recalculate for consistency
+			// For Real: we MUST calculate
+
+			// Use saved old values for calculation
+			oldQty := oldPositionSize / oldEntryPrice
 			newQty := chunk.PositionSize / chunk.EntryPrice
 			totalQty := oldQty + newQty
 
 			// New Size
-			newSize := existingPos.PositionSize + chunk.PositionSize
+			newSize := oldPositionSize + chunk.PositionSize
 			// New Entry
 			newAvgEntry := newSize / totalQty
 
@@ -790,6 +820,15 @@ func (e *TradingEngine) executeSignals(ctx context.Context, signals []*models.AI
 				log.Printf("✅ DCA %s %s (Sim) | Added: %.2f | New Avg: %.4f | Size: %.2f",
 					chunk.Side, chunk.Symbol, chunk.PositionSize, existingPos.EntryPrice, existingPos.PositionSize)
 			}
+
+			// Record Log
+			existingPos.Log = append(existingPos.Log, models.PositionLog{
+				Time:   time.Now(),
+				Type:   "DCA",
+				Price:  chunk.EntryPrice,
+				Size:   chunk.PositionSize,
+				Reason: signal.Reasoning,
+			})
 			e.mu.Unlock()
 			executed++
 			continue
@@ -807,6 +846,22 @@ func (e *TradingEngine) executeSignals(ctx context.Context, signals []*models.AI
 			log.Printf("❌ Failed to open position %s: %v", signal.Symbol, err)
 			continue
 		}
+
+		// Set CreatedAt from the signal in the cart
+		position.CreatedAt = signal.FirstSeen
+		if position.CreatedAt.IsZero() {
+			position.CreatedAt = position.OpenTime
+		}
+
+		// Set Reasoning and Initial Log
+		position.Reasoning = signal.Reasoning
+		position.Log = append(position.Log, models.PositionLog{
+			Time:   position.OpenTime,
+			Type:   "OPEN",
+			Price:  position.EntryPrice,
+			Size:   position.PositionSize,
+			Reason: signal.Reasoning,
+		})
 
 		e.mu.Lock()
 		e.positions[position.ID] = position
@@ -978,7 +1033,8 @@ func (e *TradingEngine) GetStats(ctx context.Context) *models.Stats {
 		stats.UnrealizedPL += p.UnrealizedPL
 	}
 
-	stats.TotalPL = stats.RealizedPL + stats.UnrealizedPL
+	// TotalPL is REVENUE P&L (Realized only) as per new requirement
+	stats.TotalPL = stats.RealizedPL
 
 	return stats
 }
@@ -987,6 +1043,37 @@ func (e *TradingEngine) getFreeSlots() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.maxPositions - len(e.positions)
+}
+
+func (e *TradingEngine) GetActiveSignals() []*models.AISignal {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	signals := make([]*models.AISignal, 0, len(e.activeSignals))
+	for _, s := range e.activeSignals {
+		signals = append(signals, s)
+	}
+	return signals
+}
+
+func (e *TradingEngine) updateActiveSignals(newSignals []*models.AISignal) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// New signals map for current scan
+	newMap := make(map[string]*models.AISignal)
+	now := time.Now()
+
+	for _, s := range newSignals {
+		// If already in cart, preserve FirstSeen
+		if existing, ok := e.activeSignals[s.Symbol]; ok {
+			s.FirstSeen = existing.FirstSeen
+		} else {
+			s.FirstSeen = now
+		}
+		newMap[s.Symbol] = s
+	}
+
+	e.activeSignals = newMap
 }
 
 func (e *TradingEngine) SetMaxPositions(max int) {

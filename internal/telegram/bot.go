@@ -213,11 +213,18 @@ func (b *Bot) handlePositions(c tele.Context) error {
 			emoji = "🟡"
 		}
 
+		cartDuration := p.OpenTime.Sub(p.CreatedAt)
+		if cartDuration < 0 {
+			cartDuration = 0
+		}
+
 		sb.WriteString(fmt.Sprintf(`%s *%s %s* | %.2f USDT
    📊 %.4f → %.4f (%+.2f%%)
    💰 P&L: %+.2f USDT | TP: %.4f | SL: %.4f
+   ⏰ Куплен: %s | Корзина: %s
 
-`, emoji, p.Side, p.Symbol, p.PositionSize, p.EntryPrice, p.CurrentPrice, p.PLPercent, p.UnrealizedPL, p.TakeProfit, p.StopLoss))
+`, emoji, p.Side, p.Symbol, p.PositionSize, p.EntryPrice, p.CurrentPrice, p.PLPercent, p.UnrealizedPL, p.TakeProfit, p.StopLoss,
+			p.OpenTime.Format("15:04:05"), formatDuration(cartDuration)))
 
 		totalPL += p.UnrealizedPL
 	}
@@ -360,6 +367,9 @@ func formatUptime(d time.Duration) string {
 }
 
 func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%d сек", int(d.Seconds()))
+	}
 	hours := int(d.Hours())
 	minutes := int(d.Minutes()) % 60
 	if hours > 0 {

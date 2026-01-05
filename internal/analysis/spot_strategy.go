@@ -68,15 +68,13 @@ func (s *SpotStrategy) L1Filter(ind *Indicators, strictness int) (bool, string) 
 }
 
 // AnalyzeTrendD1 performs L1 checks on Daily Klines
-func (s *SpotStrategy) AnalyzeTrendD1(klines []exchange.Kline) (bool, string, *Indicators) {
+func (s *SpotStrategy) AnalyzeTrendD1(klines []exchange.Kline, strictness int) (bool, string, *Indicators) {
 	if len(klines) < 200 {
 		return false, "Insufficient history (need 200+ D1 candles)", nil
 	}
 
 	// Calculate D1 Indicators
-	ind := CalculateIndicators(klines) // Note: This checks len<50, we have 200.
-	// We need EMA200. CalculateIndicators only does EMA20/50.
-	// We can manually add EMA200 calculation helper.
+	ind := CalculateIndicators(klines)
 
 	prices := make([]float64, len(klines))
 	for i, k := range klines {
@@ -89,10 +87,20 @@ func (s *SpotStrategy) AnalyzeTrendD1(klines []exchange.Kline) (bool, string, *I
 	ind.EMA200 = ema200 // Need to add this field to Indicators struct or just return it/use it.
 
 	// Logic
+	// Standard: Uptrend if Close > EMA200 && EMA50 > EMA200
 	isUptrend := closePrice > ema200 && ema50 > ema200
 
+	// Low strictness relaxation (< 50)
+	// If strictness is LOW, we allow shorter-term momentum even if long term is messy
+	if strictness < 50 {
+		// Just Close > EMA50 is sufficient for "Low" strictness
+		if closePrice > ema50 {
+			isUptrend = true
+		}
+	}
+
 	if isUptrend {
-		return true, "Uptrend (Close > EMA200)", ind
+		return true, "Uptrend (Close > EMA200 or Low Strictness)", ind
 	}
 
 	// Reversal check

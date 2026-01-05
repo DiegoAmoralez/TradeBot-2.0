@@ -15,8 +15,20 @@ type Position struct {
 	StopLoss     float64
 	TrailStop    float64
 	OpenTime     time.Time
+	CreatedAt    time.Time
 	UnrealizedPL float64
 	PLPercent    float64
+	Reasoning    string
+	Log          []PositionLog
+}
+
+// PositionLog tracks events for a position
+type PositionLog struct {
+	Time   time.Time
+	Type   string // "OPEN", "DCA", "TP_UPDATE", etc.
+	Price  float64
+	Size   float64
+	Reason string
 }
 
 // Trade represents a closed trade
@@ -59,4 +71,5 @@ type AISignal struct {
 	TakeProfit float64
 	StopLoss   float64
 	Reasoning  string
+	FirstSeen  time.Time
 }
